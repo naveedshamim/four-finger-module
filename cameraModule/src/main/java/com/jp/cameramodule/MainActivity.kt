@@ -8,19 +8,24 @@ import android.graphics.Bitmap
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraMetadata
+import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Telephony.Mms.Part.FILENAME
 import android.util.Log
 import android.util.Size
 import android.widget.Toast
 import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.CameraView
 import androidx.core.content.ContextCompat
+import com.google.common.util.concurrent.ListenableFuture
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonParser
 import com.jp.cameramodule.databinding.ActivityMainBinding
@@ -38,25 +43,39 @@ import retrofit2.Retrofit
 import java.io.File
 import java.io.FileOutputStream
 import java.net.SocketTimeoutException
+import java.nio.ByteBuffer
+import java.nio.file.Files.createFile
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
+typealias LumaListener = (luma: Double) -> Unit
 
 
 class MainActivity : AppCompatActivity() {
+
     private val binding: ActivityMainBinding by lazy {
         ActivityMainBinding.inflate(layoutInflater)
     }
-//    lateinit var camerav: Camera
 
     lateinit var file: File
     private var camera: Camera? = null
     private var imageCapture: ImageCapture? = null
-    lateinit var cameraview: CameraView
     lateinit var cameraCharacteristics: CameraCharacteristics
     lateinit var cameraValues: MutableList<String>
 
     lateinit var streamConfigurationMap: StreamConfigurationMap
     lateinit var imageUri : Uri
+    private lateinit var cameraExecutor: ExecutorService
+
+    private lateinit var imageAnalysis: ImageAnalysis
+
+    private lateinit var cameraProviderFuture: ListenableFuture<ProcessCameraProvider>
+    private lateinit var outputFile: File
+    private lateinit var refocusDetector: RefocusDetector
+
+
+
 
     @SuppressLint("UnsafeOptInUsageError")
     @RequiresApi(Build.VERSION_CODES.Q)
@@ -73,13 +92,28 @@ class MainActivity : AppCompatActivity() {
             cameraCharacteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
         var size: Array<Size> = streamConfigurationMap.getOutputSizes(ImageFormat.JPEG)
         cameraValues = size[0].toString().split("x") as MutableList<String>
-//        Log.d("CAMVAL", "H: ${cameraValues[0]} \nW: ${cameraValues[1]}")
-//        Log.d("CameraSize", cameraValues[0])
 
-//        binding.buttonCaptureImage2.setOnClickListener {
-//
-//            startActivity(Intent(this, MainActivity::class.java))
-//        }
+
+        outputFile = File(externalMediaDirs.first(), "${System.currentTimeMillis()}.jpg")
+
+        // Initialize camera executor
+        cameraExecutor = Executors.newSingleThreadExecutor()
+
+        // Initialize refocus detector
+        refocusDetector = RefocusDetector()
+
+        // Initialize image capture and analysis use cases
+        imageCapture = ImageCapture.Builder()
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .setTargetRotation(windowManager.defaultDisplay.rotation)
+            .build()
+
+        imageAnalysis = ImageAnalysis.Builder()
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .build()
+
+
+
 
     }
 
@@ -92,41 +126,157 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupCameraProvider() {
-        ProcessCameraProvider.getInstance(this).also { provider ->
-            provider.addListener({
-                bindPreview(provider.get())
-            }, ContextCompat.getMainExecutor(this))
-        }
+//        ProcessCameraProvider.getInstance(this).also { provider ->
+//            provider.addListener({
+                bindPreview()
+//            }, ContextCompat.getMainExecutor(this))
+//        }
     }
 
     @SuppressLint("UnsafeOptInUsageError")
-    private fun bindPreview(cameraProvider: ProcessCameraProvider) {
-        val preview: Preview = Preview.Builder()
-            .build()
+    private fun bindPreview() {
 
-        imageCapture = ImageCapture.Builder()
-            .build()
+            val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
 
-        val cameraSelector: CameraSelector = CameraSelector.Builder()
-            .requireLensFacing(CameraSelector.LENS_FACING_BACK)
-            .build()
+            cameraProviderFuture.addListener({
+                val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
 
-        val useCaseGroup = UseCaseGroup.Builder()
-            .addUseCase(preview)
-            .addUseCase(imageCapture!!)
-            .build()
+                val preview = Preview.Builder()
+                    .build()
+                    .also {
+                        it.setSurfaceProvider(binding.previewView.surfaceProvider)
+                    }
+
+                imageCapture = ImageCapture.Builder()
+                    .build()
+
+                val imageAnalysis = ImageAnalysis.Builder()
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .build()
+
+                imageAnalysis.setAnalyzer(cameraExecutor, { image ->
+                    // Process the image to detect refocus
+                    if (refocusDetector.detectRefocus(image)) {
 
 
-        camera = cameraProvider.bindToLifecycle(this, cameraSelector, useCaseGroup)
+                    }
+                    image.close()
+                })
 
-        val cameraControl = camera!!.cameraControl
-        cameraControl.enableTorch(true) // enable torch
+                val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
-        cameraview = CameraView(this)
-        camera?.let {
-            preview.setSurfaceProvider(binding.previewView.surfaceProvider)
+                try {
+                    cameraProvider.unbindAll()
+                    cameraProvider.bindToLifecycle(
+                        this, cameraSelector, preview, imageCapture, imageAnalysis
+                    )
+
+                } catch (exc: Exception) {
+                    Log.e("TAG", "Use case binding failed", exc)
+                }
+
+            }, ContextCompat.getMainExecutor(this))
+
+
+    }
+
+    private fun saveImage() {
+
+        // Trigger image capture
+//        imageCapture?.takePicture(outputFile, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
+//            override fun onImageSaved(outputFile: File) {
+//                Log.d("TAG", "Image saved: ${outputFile.absolutePath}")
+//                runOnUiThread {
+//                    Toast.makeText(applicationContext, "Image saved to ${outputFile.absolutePath}", Toast.LENGTH_SHORT).show()
+//                }
+//            }
+//
+//            override fun onError(error: ImageCaptureException) {
+//                Log.e("TAG", "Error saving image", error)
+//                runOnUiThread {
+//                    Toast.makeText(applicationContext, "Error saving image", Toast.LENGTH_SHORT).show()
+//                }
+//            }
+//        })
+
+    }
+
+
+    private class FocusDetectionAnalyzer(private val onFocused: (Boolean) -> Unit) : ImageAnalysis.Analyzer {
+        private var lastFocused = false
+        private var focusCount = 0
+
+        override fun analyze(image: ImageProxy) {
+            // Compute image sharpness using OpenCV or any other library
+            // Here we use a simple edge detection algorithm to determine sharpness
+            val sharpness = computeSharpness(image)
+
+            // Update focus state based on image sharpness
+            val isFocused = sharpness >= SHARPNESS_THRESHOLD
+            if (isFocused != lastFocused) {
+                lastFocused = isFocused
+                focusCount = if (isFocused) focusCount + 1 else 0
+                if (focusCount >= FOCUS_COUNT_THRESHOLD) {
+                    onFocused(true)
+                }
+            }
+
+            // Close image when done processing
+            image.close()
+        }
+
+        private fun computeSharpness(image: ImageProxy): Double {
+            // Get image buffer and properties
+            val yBuffer = image.planes[0].buffer
+            val ySize = image.cropRect.width() * image.cropRect.height()
+            val yArray = ByteArray(ySize)
+            yBuffer.get(yArray)
+
+            // Compute image edges using Sobel operator
+            val sobel = SobelOperator(yArray, image.cropRect.width(), image.cropRect.height())
+            val edges = sobel.getEdges()
+
+            // Compute edge density and sharpness
+            val edgeDensity = edges.sum() / (image.cropRect.width() * image.cropRect.height()).toDouble()
+            return edgeDensity * edgeDensity
+        }
+
+        private class SobelOperator(
+            private val input: ByteArray,
+            private val width: Int,
+            private val height: Int
+        ) {
+            private val kernelX = intArrayOf(-1, 0, 1, -2, 0, 2, -1, 0, 1)
+            private val kernelY = intArrayOf(-1, -2, -1, 0, 0, 0, 1, 2, 1)
+            private val output = DoubleArray(width * height)
+
+            fun getEdges(): DoubleArray {
+                for (y in 1 until height - 1) {
+                    for (x in 1 until width - 1) {
+                        val pixelX = convolve(x, y, kernelX)
+                        val pixelY = convolve(x, y, kernelY)
+                        output[x + y * width] = Math.sqrt(pixelX * pixelX + pixelY * pixelY)
+                    }
+                }
+                return output
+            }
+
+            private fun convolve(x: Int, y: Int, kernel: IntArray): Double {
+                var result = 0.0
+                for (i in kernel.indices) {
+                    val pixel = input[(x - 1 + (y - 1) * width) + i]
+                    result += pixel * kernel[i]
+                }
+                return result
+            }
+        }
+
+        companion object {
+            private const val SHARPNESS_THRESHOLD = 0.1
+            private const val FOCUS_COUNT_THRESHOLD = 1
         }
     }
+
 
     private fun onCaptureImage() {
         file = File(filesDir.absoluteFile, "unfair_left.jpg")
@@ -161,7 +311,6 @@ class MainActivity : AppCompatActivity() {
 //                .into(binding.imageView)
 //            binding.buttonCaptureImage2.visibility = View.VISIBLE
         }
-
 
         override fun onError(exception: ImageCaptureException) {
             showResultMessage(
@@ -238,17 +387,6 @@ class MainActivity : AppCompatActivity() {
 
         val hand: RequestBody = RequestBody.create("multipart/form-data".toMediaTypeOrNull(), "left")
 
-//        val httpClient = OkHttpClient.Builder()
-//        httpClient.addInterceptor(HttpLoggingInterceptor().apply {
-//            level = HttpLoggingInterceptor.Level.BODY
-//        })
-
-//        val retrofit = Retrofit.Builder().baseUrl("http://192.168.18.96:5000/")
-//            .addConverterFactory(GsonConverterFactory.create())
-//            .client(httpClient.build())
-//            .build()
-//            .create(UploadService::class.java)
-
         val httpClient = OkHttpClient.Builder()
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
@@ -291,19 +429,17 @@ class MainActivity : AppCompatActivity() {
                             Log.d("PrettyJSON" , imageUrl)
                         }
 
-
                     } else {
 
                         Log.e("PrettyJSON", response.code().toString())
-
                     }
                 }
 
             }catch (e: SocketTimeoutException){
                 Log.d("PrettyJSON" , e.toString())
             }
-
         }
     }
+
 }
 
